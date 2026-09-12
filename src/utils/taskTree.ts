@@ -2,12 +2,12 @@ import { GoogleTask, TaskTreeNode } from '../types/task';
 import { extractTags, stripTagsFromTitle } from './tagParser';
 
 /**
- * Builds a tree structure from flat Google Tasks list using the `parent` field.
- * Calculates subtask completion metrics and parses tags.
+ * Builds a tree structure from flat Google Tasks list using the `parent` field
+ * and smart hierarchy detection.
  */
 export function buildTaskTree(tasks: GoogleTask[]): TaskTreeNode[] {
   const taskMap = new Map<string, TaskTreeNode>();
-  const rootTasks: TaskTreeNode[] = [];
+  const nodes: TaskTreeNode[] = [];
 
   // Step 1: Initialize all TaskTreeNodes
   for (const task of tasks) {
@@ -15,26 +15,61 @@ export function buildTaskTree(tasks: GoogleTask[]): TaskTreeNode[] {
     const tags = extractTags(combinedText);
     const cleanTitle = stripTagsFromTitle(task.title || '') || (task.title || '');
 
-    taskMap.set(task.id, {
+    const node: TaskTreeNode = {
       ...task,
       children: [],
       subtaskCount: 0,
       completedSubtaskCount: 0,
       tags,
       cleanTitle,
-      isExpanded: true, // default expanded
-    });
+      isExpanded: true,
+    };
+
+    taskMap.set(task.id, node);
+    nodes.push(node);
   }
 
-  // Step 2: Establish parent-child relationships
-  for (const task of tasks) {
-    const node = taskMap.get(task.id)!;
-    if (task.parent && taskMap.has(task.parent)) {
-      const parentNode = taskMap.get(task.parent)!;
-      parentNode.children.push(node);
-    } else {
-      rootTasks.push(node);
+  // Sort nodes by position first to maintain user's visual sequence in Google Tasks
+  nodes.sort((a, b) => {
+    if (a.position && b.position) {
+      return a.position.localeCompare(b.position);
     }
+    return 0;
+  });
+
+  const rootTasks: TaskTreeNode[] = [];
+  let previousRootTask: TaskTreeNode | null = null;
+
+  // Step 2: Establish parent-child relationships
+  for (const node of nodes) {
+    // 2.1 Native Google Tasks parent relationship
+    if (node.parent && taskMap.has(node.parent)) {
+      const parentNode = taskMap.get(node.parent)!;
+      parentNode.children.push(node);
+      continue;
+    }
+
+    // 2.2 Smart pattern detection: if title starts with ↳, ->, or indented dashes and has a preceding task
+    const rawTitle = (node.title || '').trimStart();
+    const hasSubtaskPrefix =
+      rawTitle.startsWith('↳') ||
+      rawTitle.startsWith('->') ||
+      rawTitle.startsWith('-->') ||
+      (node.title || '').startsWith('    ');
+
+    if (hasSubtaskPrefix && previousRootTask) {
+      // Clean up the prefix for clean visual display
+      node.cleanTitle = node.cleanTitle
+        .replace(/^(↳|->|-->|\s{2,})\s*/, '')
+        .trim();
+      node.parent = previousRootTask.id;
+      previousRootTask.children.push(node);
+      continue;
+    }
+
+    // Otherwise it's a top-level root task
+    rootTasks.push(node);
+    previousRootTask = node;
   }
 
   // Step 3: Compute subtask counts for parent tasks
@@ -44,21 +79,6 @@ export function buildTaskTree(tasks: GoogleTask[]): TaskTreeNode[] {
       node.completedSubtaskCount = node.children.filter(
         (child) => child.status === 'completed'
       ).length;
-    }
-  }
-
-  // Step 4: Sort by position if available, maintaining task list order
-  const sortFn = (a: TaskTreeNode, b: TaskTreeNode) => {
-    if (a.position && b.position) {
-      return a.position.localeCompare(b.position);
-    }
-    return 0;
-  };
-
-  rootTasks.sort(sortFn);
-  for (const root of rootTasks) {
-    if (root.children.length > 0) {
-      root.children.sort(sortFn);
     }
   }
 

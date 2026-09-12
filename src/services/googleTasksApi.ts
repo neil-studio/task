@@ -84,7 +84,49 @@ export async function createTaskList(title: string): Promise<GoogleTaskList> {
 }
 
 /**
- * Fetch all tasks in a specific task list
+ * Update (rename) an existing task list
+ */
+export async function updateTaskList(
+  taskListId: string,
+  title: string
+): Promise<GoogleTaskList> {
+  const auth = getAuthState();
+  if (auth.isDemoMode || !auth.isAuthenticated) {
+    const item = mockLists.find((l) => l.id === taskListId);
+    if (item) {
+      item.title = title;
+      return item;
+    }
+    throw new Error('List not found');
+  }
+
+  return fetchWithAuth<GoogleTaskList>(
+    `/users/@me/lists/${encodeURIComponent(taskListId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    }
+  );
+}
+
+/**
+ * Delete a task list
+ */
+export async function deleteTaskList(taskListId: string): Promise<void> {
+  const auth = getAuthState();
+  if (auth.isDemoMode || !auth.isAuthenticated) {
+    mockLists = mockLists.filter((l) => l.id !== taskListId);
+    delete mockTasks[taskListId];
+    return;
+  }
+
+  await fetchWithAuth(`/users/@me/lists/${encodeURIComponent(taskListId)}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
+ * Fetch all tasks in a specific task list with full pagination
  */
 export async function getTasks(taskListId: string): Promise<GoogleTask[]> {
   const auth = getAuthState();
@@ -92,10 +134,31 @@ export async function getTasks(taskListId: string): Promise<GoogleTask[]> {
     return mockTasks[taskListId] || [];
   }
 
-  const data = await fetchWithAuth<{ items?: GoogleTask[] }>(
-    `/lists/${encodeURIComponent(taskListId)}/tasks?showCompleted=true&showHidden=true&maxResults=100`
-  );
-  return data.items || [];
+  const allTasks: GoogleTask[] = [];
+  let pageToken: string | undefined = undefined;
+
+  do {
+    const params = new URLSearchParams({
+      showCompleted: 'true',
+      showHidden: 'true',
+      maxResults: '100',
+    });
+    if (pageToken) {
+      params.set('pageToken', pageToken);
+    }
+
+    const data = await fetchWithAuth<{
+      items?: GoogleTask[];
+      nextPageToken?: string;
+    }>(`/lists/${encodeURIComponent(taskListId)}/tasks?${params.toString()}`);
+
+    if (data.items && data.items.length > 0) {
+      allTasks.push(...data.items);
+    }
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+
+  return allTasks;
 }
 
 /**
@@ -183,7 +246,7 @@ export async function updateTask(
 }
 
 /**
- * Move a task (reorder or change parent)
+ * Move a task (change parent or position)
  */
 export async function moveTask(
   taskListId: string,
@@ -195,16 +258,18 @@ export async function moveTask(
     const list = mockTasks[taskListId] || [];
     const item = list.find((t) => t.id === taskId);
     if (item) {
-      if (options.parent !== undefined) {
-        item.parent = options.parent || undefined;
-      }
+      item.parent = options.parent || undefined;
       return item;
     }
     throw new Error('Task not found in demo data');
   }
 
   const params = new URLSearchParams();
-  if (options.parent) params.set('parent', options.parent);
+  if (options.parent !== undefined) {
+    if (options.parent) {
+      params.set('parent', options.parent);
+    }
+  }
   if (options.previous) params.set('previous', options.previous);
 
   const queryStr = params.toString() ? `?${params.toString()}` : '';
@@ -229,7 +294,6 @@ export async function deleteTask(
   const auth = getAuthState();
   if (auth.isDemoMode || !auth.isAuthenticated) {
     const list = mockTasks[taskListId] || [];
-    // Also remove any child subtasks
     mockTasks[taskListId] = list.filter(
       (t) => t.id !== taskId && t.parent !== taskId
     );

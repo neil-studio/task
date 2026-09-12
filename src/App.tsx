@@ -4,9 +4,13 @@ import { AuthState } from './types/auth';
 import { getAuthState, subscribeAuth } from './services/googleAuth';
 import {
   getTaskLists,
+  createTaskList,
+  updateTaskList,
+  deleteTaskList,
   getTasks,
   createTask,
   updateTask,
+  moveTask,
   deleteTask,
 } from './services/googleTasksApi';
 import { buildTaskTree } from './utils/taskTree';
@@ -148,6 +152,23 @@ export function App() {
       setIsLoading(false);
     }
   }, [selectedListId, viewMode]);
+
+  // Task List Management
+  const handleCreateList = async (title: string) => {
+    const created = await createTaskList(title);
+    await loadLists();
+    setSelectedListId(created.id);
+  };
+
+  const handleRenameList = async (id: string, newTitle: string) => {
+    await updateTaskList(id, newTitle);
+    await loadLists();
+  };
+
+  const handleDeleteList = async (id: string) => {
+    await deleteTaskList(id);
+    await loadLists();
+  };
 
   // Compute available tags with frequencies across all visible tasks
   const availableTags = useMemo(() => {
@@ -379,13 +400,24 @@ export function App() {
     status?: TaskStatus;
   }) => {
     if (params.id) {
-      // Update
+      // Update basic fields
       await updateTask(params.taskListId, params.id, {
         title: params.title,
         notes: params.notes,
         due: params.due,
         status: params.status,
       });
+
+      // If parent is specified or changed, move task using Google Tasks move API
+      if (params.parent !== undefined) {
+        try {
+          await moveTask(params.taskListId, params.id, {
+            parent: params.parent,
+          });
+        } catch (e) {
+          console.warn('Move task hierarchy update:', e);
+        }
+      }
     } else {
       // Create
       await createTask(params.taskListId, {
@@ -461,6 +493,9 @@ export function App() {
         }}
         onOpenSettings={() => setIsSettingsOpen(true)}
         authState={authState}
+        onCreateList={handleCreateList}
+        onRenameList={handleRenameList}
+        onDeleteList={handleDeleteList}
       />
 
       {/* Tag filter bar */}
