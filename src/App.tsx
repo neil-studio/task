@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { GoogleTaskList, KanbanViewMode, TaskTreeNode, TaskStatus } from './types/task';
 import { AuthState } from './types/auth';
 import { getAuthState, subscribeAuth } from './services/googleAuth';
@@ -32,6 +32,10 @@ export function App() {
   const [parentTaskIdForNew, setParentTaskIdForNew] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
+  // Keep a ref to taskLists to prevent unnecessary effect triggers
+  const taskListsRef = useRef(taskLists);
+  taskListsRef.current = taskLists;
+
   // Subscribe to auth changes
   useEffect(() => {
     return subscribeAuth((newState) => {
@@ -39,47 +43,111 @@ export function App() {
     });
   }, []);
 
-  // Fetch task lists & tasks
-  const fetchData = useCallback(async () => {
+  // Fetch all task lists (runs on auth change or manual full refresh)
+  const loadLists = useCallback(async () => {
     try {
       setIsLoading(true);
       const lists = await getTaskLists();
       setTaskLists(lists);
 
-      if (lists.length > 0) {
-        const currentListId =
-          selectedListId && lists.some((l) => l.id === selectedListId)
-            ? selectedListId
-            : lists[0].id;
-        setSelectedListId(currentListId);
+      setSelectedListId((prevSelected) => {
+        // If previous selection is still valid, keep it!
+        if (prevSelected && lists.some((l) => l.id === prevSelected)) {
+          return prevSelected;
+        }
+        // Otherwise default to the first list
+        return lists.length > 0 ? lists[0].id : '';
+      });
+    } catch (err) {
+      console.error('Failed to load task lists', err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
 
-        // In 'list' mode, fetch all lists; in 'status' mode, fetch current selected list
-        const listsToFetch =
-          viewMode === 'list' ? lists : lists.filter((l) => l.id === currentListId);
+  // Load lists on mount or when auth state changes
+  useEffect(() => {
+    loadLists();
+  }, [loadLists, authState.isAuthenticated, authState.isDemoMode]);
 
-        const tasksMap: Record<string, TaskTreeNode[]> = {};
-        await Promise.all(
-          listsToFetch.map(async (list) => {
-            const rawTasks = await getTasks(list.id);
-            tasksMap[list.id] = buildTaskTree(rawTasks);
-          })
+  // Fetch tasks for specific list IDs without modifying selectedListId
+  const loadTasksForLists = useCallback(async (listIds: string[]) => {
+    if (listIds.length === 0) return;
+    try {
+      setIsLoading(true);
+      const results = await Promise.all(
+        listIds.map(async (id) => {
+          const rawTasks = await getTasks(id);
+          return { id, tree: buildTaskTree(rawTasks) };
+        })
+      );
+
+      setTasksByList((prev) => {
+        const next = { ...prev };
+        for (const res of results) {
+          next[res.id] = res.tree;
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error('Failed to load tasks', err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  // Load tasks whenever selectedListId or viewMode changes
+  useEffect(() => {
+    if (taskLists.length === 0) return;
+
+    if (viewMode === 'status') {
+      if (selectedListId) {
+        loadTasksForLists([selectedListId]);
+      }
+    } else {
+      // In list mode, load tasks for all lists
+      const allIds = taskLists.map((l) => l.id);
+      loadTasksForLists(allIds);
+    }
+  }, [selectedListId, viewMode, taskLists, loadTasksForLists]);
+
+  // Full manual refresh
+  const handleFullRefresh = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      const lists = await getTaskLists();
+      setTaskLists(lists);
+
+      const targetListId =
+        selectedListId && lists.some((l) => l.id === selectedListId)
+          ? selectedListId
+          : lists[0]?.id || '';
+
+      if (viewMode === 'status' && targetListId) {
+        const raw = await getTasks(targetListId);
+        setTasksByList((prev) => ({
+          ...prev,
+          [targetListId]: buildTaskTree(raw),
+        }));
+      } else if (viewMode === 'list') {
+        const results = await Promise.all(
+          lists.map(async (l) => ({
+            id: l.id,
+            tree: buildTaskTree(await getTasks(l.id)),
+          }))
         );
-
-        setTasksByList((prev) => ({ ...prev, ...tasksMap }));
-      } else {
-        setTasksByList({});
+        const map: Record<string, TaskTreeNode[]> = {};
+        results.forEach((r) => {
+          map[r.id] = r.tree;
+        });
+        setTasksByList(map);
       }
     } catch (err) {
-      console.error('Failed to load tasks data', err);
+      console.error('Refresh error', err);
     } finally {
       setIsLoading(false);
     }
   }, [selectedListId, viewMode]);
-
-  // Initial load or auth change
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
 
   // Compute available tags with frequencies across all visible tasks
   const availableTags = useMemo(() => {
@@ -160,8 +228,7 @@ export function App() {
       await updateTask(taskListId, taskId, { status: nextStatus });
     } catch (err) {
       console.error('Failed to update task status', err);
-      // Revert on error
-      fetchData();
+      loadTasksForLists([taskListId]);
     }
   };
 
@@ -218,7 +285,7 @@ export function App() {
       });
     } catch (err) {
       console.error('Failed to move task status', err);
-      fetchData();
+      loadTasksForLists([taskListId]);
     }
   };
 
@@ -240,7 +307,6 @@ export function App() {
     }));
 
     try {
-      // In Google Tasks API, moving across lists is done by recreating or move
       await deleteTask(sourceListId, taskId);
       await createTask(destListId, {
         title: task.title,
@@ -248,10 +314,10 @@ export function App() {
         due: task.due,
         status: task.status,
       });
-      fetchData();
+      loadTasksForLists([sourceListId, destListId]);
     } catch (err) {
       console.error('Failed to move task across lists', err);
-      fetchData();
+      loadTasksForLists([sourceListId, destListId]);
     }
   };
 
@@ -330,7 +396,7 @@ export function App() {
         status: params.status,
       });
     }
-    fetchData();
+    loadTasksForLists([params.taskListId]);
   };
 
   // Delete task
@@ -355,7 +421,7 @@ export function App() {
       await deleteTask(taskListId, taskId);
     } catch (err) {
       console.error('Failed to delete task', err);
-      fetchData();
+      loadTasksForLists([taskListId]);
     }
   };
 
@@ -379,17 +445,15 @@ export function App() {
         selectedListId={selectedListId}
         onSelectListId={(id) => {
           setSelectedListId(id);
-          fetchData();
         }}
         viewMode={viewMode}
         onChangeViewMode={(mode) => {
           setViewMode(mode);
-          fetchData();
         }}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
         isLoading={isLoading}
-        onRefresh={fetchData}
+        onRefresh={handleFullRefresh}
         onOpenNewTask={() => {
           setTaskToEdit(null);
           setParentTaskIdForNew(null);
@@ -455,7 +519,7 @@ export function App() {
         authState={authState}
         onAuthStateChange={() => {
           setAuthState(getAuthState());
-          fetchData();
+          loadLists();
         }}
       />
     </div>
